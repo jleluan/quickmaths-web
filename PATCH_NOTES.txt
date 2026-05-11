@@ -1,0 +1,24 @@
+QuickmathsWebDepo source-only patch
+
+This archive intentionally DOES NOT include:
+- package.json
+- package-lock.json
+- vite.config.ts
+- tsconfig.json
+- node_modules
+- dist
+
+Copy this archive over the root of your existing QuickmathsWebDepo working tree.
+
+Controls:
+- Left click: select/add block value
+- Middle click: choose target/equal block
+- Right click: unused for gameplay
+
+Important fixes:
+- Falling blocks can be selected and targeted, matching the original C++ game.
+- Middle click replaces original right-click gameplay action.
+- Scoreboard added: time, score, +pending score, high score, multiplier.
+- High score persists via localStorage.
+- Blocks can fall again when support below them is removed.
+- This score tallies into the main score after the original-style delay.

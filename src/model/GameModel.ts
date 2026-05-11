@@ -1,43 +1,82 @@
 import {
   BLOCK_SIZE,
-  NUM_COLUMNS,
-  INITIAL_SPAWN_INTERVAL,
-  DEFAULT_INTERVAL_MODIFIER,
-  MIN_SPAWN_INTERVAL,
-  DEFAULT_FALL_SPEED,
-  PER_BLOCK_MULTIPLIER_INCREASE,
+  DEFAULT_BLOCK_INTERVAL,
   DEFAULT_DIFFICULTY_LEVEL,
-  PLAYFIELD_X,
+  DEFAULT_FALL_SPEED,
+  DEFAULT_INTERVAL_MODIFIER,
   FLOOR_TOP_Y,
+  INITIAL_SPAWN_INTERVAL,
+  MIN_SPAWN_INTERVAL,
+  NUM_COLUMNS,
+  PER_BLOCK_MULTIPLIER_INCREASE,
+  PLAYFIELD_X,
+  POST_LANDING_FALL_SPEED,
+  SCORE_TRANSFER_DELAY_FRAMES,
 } from '../config/originalConstants';
 import { BlockState } from './BlockState';
 import { GameState } from './GameState';
 import { getRandomValue } from './randomValue';
 
 /**
- * GameModel encapsulates the core gameplay logic and state.
+ * Deterministic gameplay model for QuickMaths.
  *
- * Compatibility note:
- * The original C++ game allows both falling and landed blocks to be selected.
- * Selection only checks collision, active state, and whether the block is
- * already marked. Do not restrict selection to landed blocks.
+ * Phaser should render this model, but not own gameplay authority.
+ * This deliberately mirrors the original C++ rules:
+ * - left click marks/adds any active block, falling or landed
+ * - middle click replaces original right click as the target/equal action
+ * - selected values are stored until target click
+ * - multiplier increases after more than two selected blocks
+ * - correct sums add to thisScore, then thisScore tallies into score
+ * - blocks can fall again when support underneath is removed
  */
 export class GameModel {
   blocks: BlockState[] = [];
   selectedBlocks: number[] = [];
 
   score = 0;
-  pendingScore = 0;
+  highScore = 0;
+  thisScore = 0;
+  thisScoreFrames = SCORE_TRANSFER_DELAY_FRAMES;
+
   multiplier = 1;
+  difficulty = DEFAULT_DIFFICULTY_LEVEL;
+
   elapsedTime = 0;
+  lastGameTime = 0;
 
   spawnTimer = 0;
   spawnInterval = INITIAL_SPAWN_INTERVAL;
+  private intervalModifyTimer = 0;
+
   gameState: GameState = GameState.Ready;
 
-  private intervalModifyTimer = 0;
-  private difficulty = DEFAULT_DIFFICULTY_LEVEL;
   private nextBlockId = 0;
+
+  constructor(difficulty = DEFAULT_DIFFICULTY_LEVEL) {
+    this.setDifficultyLevel(difficulty);
+    this.restart();
+  }
+
+  setDifficultyLevel(difficulty: number): void {
+    this.difficulty = difficulty;
+    this.spawnInterval = Math.floor(DEFAULT_BLOCK_INTERVAL * (1 + (1 - this.difficulty)));
+  }
+
+  restart(): void {
+    this.blocks = [];
+    this.selectedBlocks = [];
+    this.score = 0;
+    this.thisScore = 0;
+    this.thisScoreFrames = SCORE_TRANSFER_DELAY_FRAMES;
+    this.multiplier = 1;
+    this.elapsedTime = 0;
+    this.lastGameTime = 0;
+    this.spawnTimer = 0;
+    this.intervalModifyTimer = 0;
+    this.nextBlockId = 0;
+    this.spawnInterval = Math.floor(DEFAULT_BLOCK_INTERVAL * (1 + (1 - this.difficulty)));
+    this.gameState = GameState.Running;
+  }
 
   update(delta: number): void {
     if (this.gameState !== GameState.Running) {
@@ -48,53 +87,38 @@ export class GameModel {
     this.spawnTimer += delta;
     this.intervalModifyTimer += delta;
 
-    if (this.spawnTimer >= this.spawnInterval) {
-      this.spawnTimer -= this.spawnInterval;
-      this.spawnBlock();
-    }
-
-    if (this.intervalModifyTimer >= 60000) {
-      this.intervalModifyTimer -= 60000;
-      this.spawnInterval = Math.max(
-        this.spawnInterval - DEFAULT_INTERVAL_MODIFIER,
-        MIN_SPAWN_INTERVAL,
-      );
-    }
-
-    this.updateFallingBlocks(delta);
+    this.updateSpawnInterval();
+    this.spawnIfNeeded();
+    this.updateBlockSupportAndMotion(delta);
     this.removeMarkedBlocks();
+    this.tallyScore();
   }
 
   spawnBlock(): void {
-    const col = Math.floor(Math.random() * NUM_COLUMNS);
-    const x = PLAYFIELD_X + col * BLOCK_SIZE;
-    const y = -BLOCK_SIZE;
+    const column = Math.floor(Math.random() * NUM_COLUMNS);
 
-    const block: BlockState = {
+    this.blocks.unshift({
       id: this.nextBlockId++,
       value: getRandomValue(),
-      x,
-      y,
+      x: PLAYFIELD_X + column * BLOCK_SIZE,
+      y: -BLOCK_SIZE,
       active: true,
       selected: false,
       falling: true,
+      hasLanded: false,
       velocityY: DEFAULT_FALL_SPEED,
-    };
-
-    this.blocks.push(block);
+    });
   }
 
   /**
-   * Original left click behaviour:
-   * - active block
-   * - not already marked/selected
-   * - falling blocks are valid
+   * Original left-click behaviour: any active, unmarked block can be
+   * selected. It does not need to have landed.
    */
   handleBlockLeftClick(blockId: number): void {
     if (this.gameState !== GameState.Running) return;
 
-    const block = this.blocks.find((b) => b.id === blockId);
-    if (!block || !block.active || block.selected || block.markedForRemoval) {
+    const block = this.findActiveBlock(blockId);
+    if (!block || block.selected || block.markedForRemoval || block.deactivated) {
       return;
     }
 
@@ -107,38 +131,31 @@ export class GameModel {
   }
 
   /**
-   * Target/equal click behaviour.
-   *
-   * In the original game this was right click. In the browser version it is
-   * triggered by middle click, but the gameplay rule is the same:
-   * choose an active block as the value the selected blocks should equal.
-   *
-   * Falling blocks are valid targets, matching the original.
+   * Browser replacement for the original right-click action.
+   * Middle click picks the target/equal block.
    */
   handleBlockTargetClick(blockId: number): void {
     if (this.gameState !== GameState.Running) return;
 
-    const target = this.blocks.find((b) => b.id === blockId);
-    if (!target || !target.active || target.markedForRemoval) {
+    const target = this.findActiveBlock(blockId);
+    if (!target || target.markedForRemoval || target.deactivated) {
       return;
     }
 
     const selectedStates = this.selectedBlocks
-      .map((id) => this.blocks.find((b) => b.id === id))
-      .filter((b): b is BlockState => !!b && b.active);
+      .map((id) => this.findActiveBlock(id))
+      .filter((block): block is BlockState => Boolean(block));
 
-    if (selectedStates.length < 2 || target.selected) {
+    if (selectedStates.length < 2) {
       this.clearSelection();
       return;
     }
 
-    const selectedSum = selectedStates.reduce((acc, b) => acc + b.value, 0);
+    const playerSummed = selectedStates.reduce((sum, block) => sum + block.value, 0);
 
-    if (selectedSum === target.value) {
-      const scoredTotal = selectedSum + target.value;
-      this.pendingScore += Math.ceil(
-        scoredTotal * this.multiplier * this.difficulty,
-      );
+    if (playerSummed === target.value) {
+      const scoredValue = playerSummed + target.value;
+      this.thisScore += Math.ceil((scoredValue * this.multiplier) * this.difficulty);
 
       for (const block of selectedStates) {
         block.markedForRemoval = true;
@@ -156,15 +173,117 @@ export class GameModel {
   }
 
   /**
-   * Backwards-compatible alias while older scene code is being cleaned up.
+   * Backwards-compatible alias while old view code is phased out.
    */
   handleBlockRightClick(blockId: number): void {
     this.handleBlockTargetClick(blockId);
   }
 
+  private updateSpawnInterval(): void {
+    if (this.intervalModifyTimer < 60000) {
+      return;
+    }
+
+    this.intervalModifyTimer = 0;
+    this.spawnInterval = Math.max(
+      this.spawnInterval - DEFAULT_INTERVAL_MODIFIER,
+      MIN_SPAWN_INTERVAL,
+    );
+  }
+
+  private spawnIfNeeded(): void {
+    if (this.spawnTimer < this.spawnInterval) {
+      return;
+    }
+
+    this.spawnBlock();
+    this.spawnTimer = 0;
+  }
+
+  private updateBlockSupportAndMotion(delta: number): void {
+    for (const block of this.blocks) {
+      if (!block.active || block.markedForRemoval || block.deactivated) {
+        continue;
+      }
+
+      const landingY = this.getLandingY(block);
+
+      if (!block.falling && block.y < landingY - 0.01) {
+        block.falling = true;
+        block.velocityY = block.hasLanded ? POST_LANDING_FALL_SPEED : DEFAULT_FALL_SPEED;
+      }
+
+      if (!block.falling) {
+        continue;
+      }
+
+      block.y += block.velocityY * delta;
+
+      if (block.y >= landingY) {
+        block.y = landingY;
+        block.falling = false;
+        block.hasLanded = true;
+        block.velocityY = 0;
+
+        if (block.y <= 0) {
+          this.lastGameTime = this.elapsedTime;
+          this.gameState = GameState.GameOver;
+        }
+      }
+    }
+  }
+
+  private getLandingY(block: BlockState): number {
+    let landingY = FLOOR_TOP_Y - BLOCK_SIZE;
+
+    for (const other of this.blocks) {
+      if (
+        other === block ||
+        !other.active ||
+        other.markedForRemoval ||
+        other.deactivated ||
+        other.x !== block.x ||
+        other.y <= block.y
+      ) {
+        continue;
+      }
+
+      landingY = Math.min(landingY, other.y - BLOCK_SIZE);
+    }
+
+    return landingY;
+  }
+
+  private removeMarkedBlocks(): void {
+    if (!this.blocks.some((block) => block.markedForRemoval)) {
+      return;
+    }
+
+    this.blocks = this.blocks.filter((block) => !block.markedForRemoval);
+  }
+
+  /**
+   * Match the original score transfer behaviour:
+   * wait for SCORE_TRANSFER_DELAY_FRAMES, then move one point per update
+   * from thisScore into score until the pending score is empty.
+   */
+  private tallyScore(): void {
+    if (this.thisScore <= 0) {
+      this.thisScoreFrames = SCORE_TRANSFER_DELAY_FRAMES;
+      return;
+    }
+
+    this.thisScoreFrames--;
+
+    if (this.thisScoreFrames < 0) {
+      this.thisScore--;
+      this.score++;
+    }
+  }
+
   private clearSelection(): void {
     for (const id of this.selectedBlocks) {
-      const block = this.blocks.find((b) => b.id === id);
+      const block = this.findActiveBlock(id);
       if (block) {
         block.selected = false;
       }
@@ -174,53 +293,7 @@ export class GameModel {
     this.multiplier = 1;
   }
 
-  private updateFallingBlocks(delta: number): void {
-    for (const block of this.blocks) {
-      if (!block.active || block.markedForRemoval || !block.falling) {
-        continue;
-      }
-
-      block.y += block.velocityY * delta;
-
-      const floorY = FLOOR_TOP_Y - BLOCK_SIZE;
-      let landingY = floorY;
-
-      for (const other of this.blocks) {
-        if (
-          other === block ||
-          !other.active ||
-          other.markedForRemoval ||
-          other.falling ||
-          other.x !== block.x
-        ) {
-          continue;
-        }
-
-        const candidateY = other.y - BLOCK_SIZE;
-        if (candidateY < landingY && block.y <= candidateY + BLOCK_SIZE) {
-          landingY = candidateY;
-        }
-      }
-
-      if (block.y >= landingY) {
-        block.y = landingY;
-        block.falling = false;
-        block.velocityY = 0;
-
-        if (block.y <= 0) {
-          this.gameState = GameState.GameOver;
-        }
-      }
-    }
-  }
-
-  private removeMarkedBlocks(): void {
-    if (!this.blocks.some((b) => b.markedForRemoval)) {
-      return;
-    }
-
-    this.score += this.pendingScore;
-    this.pendingScore = 0;
-    this.blocks = this.blocks.filter((b) => !b.markedForRemoval);
+  private findActiveBlock(id: number): BlockState | undefined {
+    return this.blocks.find((block) => block.id === id && block.active);
   }
 }
