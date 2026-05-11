@@ -1,4 +1,14 @@
-import { BLOCK_SIZE, NUM_COLUMNS, INITIAL_SPAWN_INTERVAL } from '../config/originalConstants';
+import {
+  BLOCK_SIZE,
+  NUM_COLUMNS,
+  INITIAL_SPAWN_INTERVAL,
+  DEFAULT_INTERVAL_MODIFIER,
+  MIN_SPAWN_INTERVAL,
+  DEFAULT_FALL_SPEED,
+  PER_BLOCK_MULTIPLIER_INCREASE,
+  DEFAULT_DIFFICULTY_LEVEL,
+  GAME_HEIGHT,
+} from '../config/originalConstants';
 import { BlockState } from './BlockState';
 import { GameState } from './GameState';
 import { getRandomValue } from './randomValue';
@@ -30,6 +40,14 @@ export class GameModel {
   spawnTimer = 0;
   /** The time interval in milliseconds between spawns. */
   spawnInterval = INITIAL_SPAWN_INTERVAL;
+
+  /** Tracks time elapsed since the last interval reduction. Once this
+   * exceeds 60 seconds the spawn interval is decreased by
+   * DEFAULT_INTERVAL_MODIFIER. */
+  private intervalModifyTimer = 0;
+
+  /** Current difficulty multiplier (m_difficultyLevel in C++). */
+  private difficulty = DEFAULT_DIFFICULTY_LEVEL;
   /** Current game state. Determines whether updates occur. */
   gameState: GameState = GameState.Ready;
   /** Next unique identifier for a newly spawned block. */
@@ -46,6 +64,7 @@ export class GameModel {
     }
     this.elapsedTime += delta;
     this.spawnTimer += delta;
+    this.intervalModifyTimer += delta;
 
     // Spawn blocks at regular intervals
     if (this.spawnTimer >= this.spawnInterval) {
@@ -53,12 +72,66 @@ export class GameModel {
       this.spawnBlock();
     }
 
-    // Move blocks downwards. In the C++ version velocity is tied to
-    // autoMove and is adjusted by collision rules; here we start with a
-    // basic constant fall speed (pixels per ms) until full logic is ported.
-    const fallSpeed = 0.1; // placeholder: 0.1 px per ms -> 100 px/s
+    // Gradually reduce the spawn interval every minute. This increases
+    // difficulty by spawning blocks more frequently. A minimum interval
+    // prevents the rate from becoming unmanageable. Mirrors the C++
+    // behaviour of m_dropModifierTime and m_blockInterval.
+    const minute = 60000;
+    if (this.intervalModifyTimer >= minute) {
+      this.intervalModifyTimer -= minute;
+      this.spawnInterval = Math.max(this.spawnInterval - DEFAULT_INTERVAL_MODIFIER, MIN_SPAWN_INTERVAL);
+    }
+
+    // Compute floor Y coordinate based on the configured game height. The
+    // centre of the block sits BLOCK_SIZE/2 units above the floor.
+    const floorCenterY = GAME_HEIGHT - BLOCK_SIZE / 2;
+    // Update block positions and handle collisions. We iterate over all
+    // active blocks. Falling blocks move downward at their own velocity
+    // until they collide with the floor or another landed block. Landed
+    // blocks remain stationary. Blocks flagged for removal are skipped.
     for (const block of this.blocks) {
-      block.y += delta * fallSpeed;
+      if (!block.active || block.markedForRemoval) {
+        continue;
+      }
+      if (!block.landed) {
+        // Apply velocity
+        block.y += block.velocityY * delta;
+        // Detect collision with other landed blocks in the same column
+        const columnBlocks = this.blocks.filter((b) => b !== block && b.active && b.landed && Math.abs(b.x - block.x) < 0.1);
+        let nearestBelow: BlockState | undefined;
+        for (const other of columnBlocks) {
+          if (!nearestBelow || other.y < nearestBelow.y) {
+            nearestBelow = other;
+          }
+        }
+        if (nearestBelow) {
+          const targetY = nearestBelow.y - BLOCK_SIZE;
+          if (block.y >= targetY) {
+            block.y = targetY;
+            block.landed = true;
+            block.velocityY = 0;
+          }
+        } else {
+          // No block beneath; check floor
+          if (block.y >= floorCenterY) {
+            block.y = floorCenterY;
+            block.landed = true;
+            block.velocityY = 0;
+          }
+        }
+        // Game over if a landed block touches the top of the playfield
+        if (block.landed && block.y - BLOCK_SIZE / 2 <= 0) {
+          this.gameState = GameState.GameOver;
+        }
+      }
+    }
+
+    // Remove any blocks that were marked for removal after correct sums. We
+    // perform removal here to avoid interfering with iteration during
+    // selection or physics updates. Removal also resets their state so
+    // they are no longer considered in future logic.
+    if (this.blocks.some((b) => b.markedForRemoval)) {
+      this.blocks = this.blocks.filter((b) => !b.markedForRemoval);
     }
   }
 
@@ -68,8 +141,12 @@ export class GameModel {
    * just above the top of the screen.
    */
   spawnBlock(): void {
+    // Choose a random column and position the block centred within it. The
+    // x-offset leaves room for a scoreboard on the left side. Columns
+    // occupy the full game width evenly in the current implementation.
     const col = Math.floor(Math.random() * NUM_COLUMNS);
     const x = col * BLOCK_SIZE + BLOCK_SIZE / 2;
+    // Spawn above the top of the screen so blocks fall into view.
     const y = -BLOCK_SIZE / 2;
     const block: BlockState = {
       id: this.nextBlockId++,
@@ -78,6 +155,8 @@ export class GameModel {
       y,
       active: true,
       selected: false,
+      landed: false,
+      velocityY: DEFAULT_FALL_SPEED,
     };
     this.blocks.push(block);
   }
@@ -90,9 +169,16 @@ export class GameModel {
     if (this.gameState !== GameState.Running) return;
     const block = this.blocks.find((b) => b.id === blockId);
     if (!block || !block.active) return;
-    if (block.selected) return;
+    // Only allow selection of landed blocks; falling blocks cannot be selected
+    if (!block.landed || block.selected) return;
     block.selected = true;
     this.selectedBlocks.push(blockId);
+    // Update multiplier: more than two selected blocks increases multiplier
+    if (this.selectedBlocks.length > 2) {
+      this.multiplier += PER_BLOCK_MULTIPLIER_INCREASE;
+    } else {
+      this.multiplier = 1;
+    }
   }
 
   /**
@@ -104,37 +190,37 @@ export class GameModel {
   handleBlockRightClick(blockId: number): void {
     if (this.gameState !== GameState.Running) return;
     const target = this.blocks.find((b) => b.id === blockId);
-    if (!target || !target.active) return;
-    // Compute selected sum
-    const sum = this.selectedBlocks
+    if (!target || !target.active || !target.landed) return;
+    // Compute the sum of selected block values
+    const selectedStates = this.selectedBlocks
       .map((id) => this.blocks.find((b) => b.id === id))
-      .filter((b): b is BlockState => !!b)
-      .reduce((acc, b) => acc + b.value, 0);
+      .filter((b): b is BlockState => !!b);
+    const sum = selectedStates.reduce((acc, b) => acc + b.value, 0);
+    // If no blocks are selected or target is selected, treat as noop
+    if (selectedStates.length === 0 || target.selected) {
+      return;
+    }
     if (sum === target.value) {
-      // Correct answer: mark blocks inactive
-      for (const id of this.selectedBlocks) {
-        const b = this.blocks.find((blk) => blk.id === id);
-        if (b) {
-          b.active = false;
-          b.selected = false;
-        }
+      // Correct answer: award score and mark blocks for removal
+      // Score is (sum + target) multiplied by current multiplier and difficulty
+      const total = sum + target.value;
+      this.score += Math.ceil(total * this.multiplier * this.difficulty);
+      // Mark all selected blocks and the target for removal
+      for (const b of selectedStates) {
+        b.markedForRemoval = true;
+        b.selected = false;
       }
-      target.active = false;
-      // Increase multiplier when more than two blocks are selected
-      if (this.selectedBlocks.length >= 3) {
-        this.multiplier += 0.5;
-      }
-      this.score += (sum + target.value) * this.multiplier;
+      target.markedForRemoval = true;
+      // Reset multiplier to baseline for next sequence
+      this.multiplier = 1;
     } else {
-      // Wrong answer: reset selections and multiplier
-      for (const id of this.selectedBlocks) {
-        const b = this.blocks.find((blk) => blk.id === id);
-        if (b) {
-          b.selected = false;
-        }
+      // Wrong answer: deselect blocks and reset multiplier
+      for (const b of selectedStates) {
+        b.selected = false;
       }
       this.multiplier = 1;
     }
+    // Clear selection list
     this.selectedBlocks = [];
   }
 }
