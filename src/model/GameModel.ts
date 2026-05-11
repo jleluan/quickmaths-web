@@ -189,6 +189,37 @@ export class GameModel {
         }
       }
       this.blocks = survivors;
+
+      // After removing blocks, some previously landed blocks may now lack support beneath
+      // them. In the original game these blocks would immediately begin falling to fill
+      // gaps left by destroyed blocks. To replicate this behaviour we iterate over the
+      // remaining blocks and unset the landed flag for any block that no longer sits on
+      // either the floor or another landed block. This ensures gravitational physics
+      // resumes for those blocks and prevents unnatural floating blocks.
+      const floorCenterY = GAME_HEIGHT - BLOCK_SIZE / 2;
+      for (const block of this.blocks) {
+        if (!block.active || !block.landed) continue;
+        const expectedY = block.y + BLOCK_SIZE;
+        let hasSupport = false;
+        // Check support from the floor
+        if (Math.abs(expectedY - floorCenterY) < 0.1) {
+          hasSupport = true;
+        } else {
+          // Check support from another landed block directly beneath
+          for (const other of this.blocks) {
+            if (other === block) continue;
+            if (!other.active || !other.landed) continue;
+            if (Math.abs(other.x - block.x) < 0.1 && Math.abs(other.y - expectedY) < 0.1) {
+              hasSupport = true;
+              break;
+            }
+          }
+        }
+        if (!hasSupport) {
+          block.landed = false;
+          block.velocityY = DEFAULT_FALL_SPEED;
+        }
+      }
     }
 
     // Gradually transfer points from thisScore into score. Each frame
@@ -280,8 +311,12 @@ export class GameModel {
     this.selectedBlocks.push(blockId);
     // Update multiplier: more than two selected blocks increases multiplier
     if (this.selectedBlocks.length > 2) {
-      this.multiplier += PER_BLOCK_MULTIPLIER_INCREASE;
+      // Increase the multiplier by a fixed amount scaled by the current difficulty level, mirroring
+      // the original C++ behaviour where m_multi += 0.3f * m_difficultyLevel【385016559686316†L656-L693】.
+      this.multiplier += PER_BLOCK_MULTIPLIER_INCREASE * this.difficulty;
     } else {
+      // When two or fewer blocks are selected the multiplier resets to its baseline. This prevents
+      // small selections from carrying over a higher multiplier from previous sums.
       this.multiplier = 1;
     }
   }
@@ -303,36 +338,44 @@ export class GameModel {
   handleBlockTargetClick(blockId: number): void {
     if (this.gameState !== GameState.Running) return;
     const target = this.blocks.find((b) => b.id === blockId);
+    // Ignore clicks on inactive blocks
     if (!target || !target.active) return;
-    // Compute the sum of selected block values
+    // Resolve selected block states
     const selectedStates = this.selectedBlocks
       .map((id) => this.blocks.find((b) => b.id === id))
       .filter((b): b is BlockState => !!b);
-    const sum = selectedStates.reduce((acc, b) => acc + b.value, 0);
-    // If no blocks are selected or target is selected, treat as noop
-    if (selectedStates.length === 0 || target.selected) {
+    // Treat selecting the target while it is selected or having fewer than two selected blocks as an incorrect guess.
+    // In the original game, gameplayEquals() requires at least two addends; otherwise all selections are cleared and the
+    // multiplier reset【385016559686316†L656-L693】.
+    if (selectedStates.length < 2 || target.selected) {
+      for (const b of selectedStates) {
+        b.selected = false;
+      }
+      this.multiplier = 1;
+      this.selectedBlocks = [];
       return;
     }
+    // Compute the sum of selected values
+    const sum = selectedStates.reduce((acc, b) => acc + b.value, 0);
     if (sum === target.value) {
-      // Correct answer: award score via thisScore and mark blocks for removal
-      // Score increment is (sum + target) multiplied by current multiplier and difficulty
+      // Correct answer: include the target's value in the total and award points
       const total = sum + target.value;
       this.thisScore += Math.ceil(total * this.multiplier * this.difficulty);
-      // Mark all selected blocks and the target for removal
+      // Flag all selected blocks and the target for removal
       for (const b of selectedStates) {
         b.markedForRemoval = true;
         b.selected = false;
       }
       target.markedForRemoval = true;
     } else {
-      // Wrong answer: deselect blocks and reset multiplier
+      // Wrong answer: deselect all selected blocks (they remain in play)【385016559686316†L656-L693】
       for (const b of selectedStates) {
         b.selected = false;
       }
     }
-    // Reset multiplier to baseline for next sequence
+    // Whether the answer was correct or incorrect, the multiplier resets and the selection list clears for the next
+    // calculation【385016559686316†L656-L693】.
     this.multiplier = 1;
-    // Clear selection list
     this.selectedBlocks = [];
   }
 }
